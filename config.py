@@ -2,17 +2,59 @@
 Centralized configuration for Pocket AI.
 """
 
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+# --- Claude API Configuration ---
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "1024"))
+CLAUDE_MONTHLY_LIMIT = float(os.getenv("CLAUDE_MONTHLY_LIMIT", "15.0"))
+
 # --- Model Configuration ---
-RESPONDER_MODEL = "qwen3:1.7b"
+RESPONDER_MODEL = "qwen3:1.7b"  # Default fallback
 OLLAMA_URL = "http://localhost:11434/api"
 LOCAL_ROUTER_PATH = "./merged_model"
 HF_ROUTER_REPO = "nlouis/pocket-ai-router"  # Hugging Face repo for auto-download
 MAX_HISTORY = 20
 
+# --- Smart Model Routing ---
+# Maps router function → (model, think_enabled, max_tokens)
+MODEL_ROUTING = {
+    # Conversational model for greetings, chitchat, quick facts (1.7b needed for bilingual)
+    "nonthinking":           ("qwen3:1.7b",       False,  128),
+    # Medium model for actions needing a natural reply
+    "control_light":         ("qwen3:0.6b",       False,  128),
+    "set_timer":             ("qwen3:0.6b",       False,  128),
+    "set_alarm":             ("qwen3:0.6b",       False,  128),
+    "create_calendar_event": ("qwen3:0.6b",       False,  128),
+    "add_task":              ("qwen3:0.6b",       False,  128),
+    # Reasoning model for complex queries
+    "thinking":              ("deepseek-r1:1.5b",  True,  1024),
+    # Medium model for web search (needs to summarize results)
+    "web_search":            ("qwen3:1.7b",        True,  512),
+    # Medium model for system info (needs to format data)
+    "get_system_info":       ("qwen3:1.7b",        False, 256),
+}
+
 # --- TTS Configuration ---
-TTS_VOICE_MODEL = "en_GB-northern_english_male-medium"
-TTS_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx"
-TTS_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx.json"
+# TTS_PROVIDER options: "kokoro" (free, local, fast) or "edge" (free, online)
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "kokoro")
+
+# Kokoro TTS voices (free, local, fast — hexgrad/Kokoro-82M)
+KOKORO_VOICES = {
+    "en": "af_heart",    # American female — warm and natural
+    "pt": "af_heart",    # Same warm voice on PT pipeline
+}
+
+# Edge TTS voices (free, no API key needed — fallback)
+EDGE_TTS_VOICES = {
+    "en": "en-US-AvaNeural",                  # Natural female voice
+    "pt": "pt-BR-ThalitaMultilingualNeural",   # Multilingual neural voice
+}
+
+TTS_DEFAULT_LANG = "en"  # Fallback language
 
 # --- STT Configuration ---
 # Using RealTimeSTT for real-time speech-to-text
@@ -20,10 +62,10 @@ STT_MODEL_PATH = None  # Not used with RealTimeSTT (kept for compatibility)
 STT_USE_WHISPER = False  # Not used with RealTimeSTT (kept for compatibility)
 WHISPER_MODEL_SIZE = "base"  # Not used with RealTimeSTT (kept for compatibility)
 WAKE_WORD_DETECTION_METHOD = "transcription"  # RealTimeSTT uses transcription-based detection
-REALTIMESTT_MODEL = "base"  # RealTimeSTT model: "tiny", "base", "small", "medium", "large"
+REALTIMESTT_MODEL = "small"  # RealTimeSTT model: "tiny", "base", "small", "medium", "large"
 USE_PORCUPINE_WAKE_WORD = False  # Use Porcupine for wake word detection (more accurate, requires API key)
 PORCUPINE_ACCESS_KEY = None  # Get from https://console.picovoice.ai/ (optional, for better wake word detection)
-WAKE_WORD = "jarvis"
+WAKE_WORD = "Tali"
 WAKE_WORD_SENSITIVITY = 0.4  # For audio pattern matching (0.0-1.0, higher = more sensitive) - Lowered to reduce false positives
 WAKE_WORD_CONFIRMATION_COUNT = 1  # Require multiple detections before triggering (reduces false positives)
 STT_SAMPLE_RATE = 16000

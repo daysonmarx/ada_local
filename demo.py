@@ -139,9 +139,8 @@ def check_device_status():
         print(f"  Router Model: {GRAY}Not loaded{RESET}")
     
     # Check TTS engine
-    if tts.piper_exe:
-        print(f"  TTS Engine: PiperTTS ({tts.VOICE_MODEL})")
-        print(f"  TTS Device: CPU (ONNX)")
+    if hasattr(tts, '_initialized') and tts._initialized:
+        print(f"  TTS Engine: SmartTTS")
     else:
         print(f"  TTS Engine: {GRAY}Not loaded{RESET}")
     

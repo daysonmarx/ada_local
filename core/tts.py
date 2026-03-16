@@ -1,22 +1,29 @@
 """
-TTS (Text-to-Speech) module using Piper TTS executable.
-Provides streaming sentence-based synthesis with interrupt support.
-Uses pre-built Piper Windows executable for full Windows compatibility.
+TTS (Text-to-Speech) module with pluggable providers.
+Supports Kokoro (free, local, fast) and Edge TTS (free, online fallback).
+Auto-detects language (English/Portuguese) and selects the appropriate voice.
+
+Strategy: Collect the full LLM response, then synthesize and play it as one
+continuous audio clip.  This avoids choppy playback caused by many small
+synthesis calls with gaps between them.
 """
 
+import asyncio
 import io
-import os
 import re
 import queue
-import shutil
-import subprocess
 import threading
-import zipfile
-import requests
-from pathlib import Path
+import time
 
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
+
+from config import (
+    TTS_PROVIDER, TTS_DEFAULT_LANG,
+    KOKORO_VOICES,
+    EDGE_TTS_VOICES,
+)
 
 # ANSI colors for console output
 GRAY = "\033[90m"
@@ -25,23 +32,53 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RESET = "\033[0m"
 
-# HTTP session for downloads
-http_session = requests.Session()
+# Kokoro output sample rate (fixed by the model)
+_KOKORO_SR = 24000
+
+# Common Portuguese words for language detection
+_PT_WORDS = {
+    "olá", "oi", "obrigado", "obrigada", "bom", "boa", "dia", "noite", "tarde",
+    "como", "você", "voce", "está", "tudo", "bem", "sim", "não", "nao", "por",
+    "favor", "para", "isso", "aqui", "agora", "ainda", "mais", "muito", "também",
+    "porque", "quando", "onde", "qual", "quem", "fazer", "pode", "preciso",
+    "eu", "ele", "ela", "nós", "eles", "elas", "meu", "minha", "seu", "sua",
+    "com", "sem", "mas", "que", "uma", "dos", "das", "nos", "nas", "aos",
+    "pela", "pelo", "são", "tem", "há", "foi", "ser", "ter", "estar",
+    "então", "entao", "já", "sempre", "nunca", "hoje", "amanhã", "ontem",
+    "certo", "claro", "verdade", "belo", "bonito", "bonita", "feliz",
+}
+
+_PT_CHARS = set("àáâãçéêíóôõúü")
+
+
+def detect_language(text: str) -> str:
+    """Detect whether text is Portuguese or English. Returns 'pt' or 'en'."""
+    text_lower = text.lower()
+    # Check for Portuguese-specific accented characters
+    if any(c in _PT_CHARS for c in text_lower):
+        return "pt"
+    # Check word overlap — require stronger signal to avoid false positives
+    words = set(re.findall(r'\b\w+\b', text_lower))
+    # Exclude very short/ambiguous words and proper names that overlap
+    _AMBIGUOUS = {"para", "com", "sem", "que", "uma", "tem", "mas", "tali"}
+    pt_matches = (words & _PT_WORDS) - _AMBIGUOUS
+    # Need at least 2 strong Portuguese words, or 1 if text is very short (<=2 words)
+    if len(pt_matches) >= 2 or (len(pt_matches) == 1 and len(words) <= 2):
+        return "pt"
+    return "en"
 
 
 class SentenceBuffer:
     """Buffers streaming text and extracts complete sentences."""
-    
+
     SENTENCE_ENDINGS = re.compile(r'([.!?])\s+|([.!?])$')
-    
+
     def __init__(self):
         self.buffer = ""
-    
+
     def add(self, text):
-        """Add text chunk and return any complete sentences."""
         self.buffer += text
         sentences = []
-        
         while True:
             match = self.SENTENCE_ENDINGS.search(self.buffer)
             if match:
@@ -52,273 +89,307 @@ class SentenceBuffer:
                 self.buffer = self.buffer[end_pos:]
             else:
                 break
-        
         return sentences
-    
+
     def flush(self):
-        """Return any remaining text as a final sentence."""
         remaining = self.buffer.strip()
         self.buffer = ""
         return remaining if remaining else None
 
 
-class PiperTTS:
-    """Piper TTS wrapper using pre-built executable for Windows compatibility."""
-    
-    VOICE_MODEL = "en_GB-northern_english_male-medium"
-    MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx"
-    CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/northern_english_male/medium/en_GB-northern_english_male-medium.onnx.json"
-    
-    # Piper Windows executable
-    PIPER_VERSION = "2023.11.14-2"
-    PIPER_RELEASE_URL = f"https://github.com/rhasspy/piper/releases/download/{PIPER_VERSION}/piper_windows_amd64.zip"
-    
+# ---------------------------------------------------------------------------
+# Provider: Kokoro TTS (free, local, fast)
+# ---------------------------------------------------------------------------
+
+class _KokoroProvider:
+    """Synthesize speech using Kokoro TTS (hexgrad/Kokoro-82M).
+    Runs entirely locally — no API key needed, very fast on Apple Silicon.
+    """
+
+    def __init__(self):
+        from kokoro import KPipeline
+        print(f"{CYAN}[TTS] Loading Kokoro English pipeline...{RESET}")
+        self._en_pipe = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+        print(f"{CYAN}[TTS] Loading Kokoro Portuguese pipeline...{RESET}")
+        self._pt_pipe = KPipeline(lang_code="p", repo_id="hexgrad/Kokoro-82M")
+
+    def synthesize(self, text: str, interrupt_event: threading.Event):
+        """Return (audio_data, samplerate) or None."""
+        lang = detect_language(text)
+        voice = KOKORO_VOICES.get(lang, KOKORO_VOICES.get(TTS_DEFAULT_LANG))
+        pipeline = self._pt_pipe if lang == "pt" else self._en_pipe
+
+        # Kokoro yields chunks — collect them all into one array
+        audio_chunks = []
+        for _gs, _ps, audio in pipeline(text, voice=voice):
+            if interrupt_event.is_set():
+                return None
+            audio_chunks.append(audio)
+
+        if interrupt_event.is_set() or not audio_chunks:
+            return None
+
+        audio_data = np.concatenate(audio_chunks)
+        return audio_data, _KOKORO_SR
+
+
+# ---------------------------------------------------------------------------
+# Provider: Edge TTS (free, online — fallback)
+# ---------------------------------------------------------------------------
+
+class _EdgeTTSProvider:
+    """Synthesize speech using Microsoft Edge TTS (free, no API key)."""
+
+    def __init__(self):
+        import edge_tts  # noqa: F401 – ensure available
+        self._edge_tts = edge_tts
+
+    def synthesize(self, text: str, interrupt_event: threading.Event):
+        """Return (audio_data, samplerate) or None."""
+        lang = detect_language(text)
+        voice = EDGE_TTS_VOICES.get(lang, EDGE_TTS_VOICES.get(TTS_DEFAULT_LANG))
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(self._synthesize_async(text, voice, interrupt_event))
+        finally:
+            loop.close()
+
+    async def _synthesize_async(self, text, voice, interrupt_event):
+        communicate = self._edge_tts.Communicate(text, voice)
+        audio_bytes = io.BytesIO()
+        async for chunk in communicate.stream():
+            if interrupt_event.is_set():
+                return None
+            if chunk["type"] == "audio":
+                audio_bytes.write(chunk["data"])
+        if interrupt_event.is_set() or audio_bytes.getbuffer().nbytes == 0:
+            return None
+        audio_bytes.seek(0)
+        audio_data, samplerate = sf.read(audio_bytes)
+        return audio_data, samplerate
+
+
+# ---------------------------------------------------------------------------
+# Main TTS class
+# ---------------------------------------------------------------------------
+
+# How long to wait (seconds) after the last queued sentence before we consider
+# the response "complete" and send the collected text to the TTS provider.
+_COLLECT_TIMEOUT = 8.0
+
+# Sentinel value: when queued, tells the worker to speak everything collected so far
+_FLUSH_SENTINEL = "__FLUSH__"
+
+
+class SmartTTS:
+    """TTS engine with pluggable provider and language auto-detection.
+
+    Instead of synthesizing each sentence individually (which causes choppy
+    playback due to per-call latency), this class collects all sentences
+    from a streaming LLM response and synthesizes them as one continuous block.
+    """
+
     def __init__(self):
         self.enabled = False
-        self.piper_exe = None
-        self.model_path = None
-        self.speech_queue = queue.Queue()
+        self.speech_queue = queue.Queue()  # receives individual sentences
         self.worker_thread = None
         self.running = False
         self.interrupt_event = threading.Event()
-        self.piper_dir = Path.home() / ".local" / "share" / "piper"
-        self.models_dir = self.piper_dir / "voices"
-        self.current_process = None
-        self.available = True  # We'll check during initialize
-    
-    def _download_piper_executable(self):
-        """Download and extract Piper Windows executable."""
-        piper_exe_dir = self.piper_dir / "piper_windows"
-        piper_exe = piper_exe_dir / "piper.exe"
-        
-        if piper_exe.exists():
-            print(f"{GREEN}[TTS] ✓ Piper executable found{RESET}")
-            return str(piper_exe)
-        
-        print(f"{CYAN}[TTS] Downloading Piper executable...{RESET}")
-        self.piper_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            r = http_session.get(self.PIPER_RELEASE_URL, stream=True)
-            r.raise_for_status()
-            
-            # Download to memory and extract
-            zip_data = io.BytesIO()
-            total_size = int(r.headers.get('content-length', 0))
-            downloaded = 0
-            
-            for chunk in r.iter_content(chunk_size=8192):
-                zip_data.write(chunk)
-                downloaded += len(chunk)
-                if total_size > 0:
-                    pct = (downloaded / total_size) * 100
-                    print(f"\r{CYAN}[TTS] Downloading... {pct:.1f}%{RESET}", end="", flush=True)
-            
-            print()  # New line after download
-            
-            # Extract zip
-            zip_data.seek(0)
-            with zipfile.ZipFile(zip_data, 'r') as zf:
-                # Extract to piper_windows directory
-                piper_exe_dir.mkdir(parents=True, exist_ok=True)
-                for member in zf.namelist():
-                    # Extract files, stripping the top-level piper directory
-                    if member.startswith("piper/"):
-                        target_path = piper_exe_dir / member[6:]  # Remove "piper/" prefix
-                        if member.endswith('/'):
-                            target_path.mkdir(parents=True, exist_ok=True)
-                        else:
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            with zf.open(member) as src, open(target_path, 'wb') as dst:
-                                dst.write(src.read())
-            
-            print(f"{GREEN}[TTS] ✓ Piper executable extracted!{RESET}")
-            return str(piper_exe)
-            
-        except Exception as e:
-            print(f"{YELLOW}[TTS] Failed to download Piper executable: {e}{RESET}")
-            return None
-    
-    def _download_model(self):
-        """Download voice model if not present."""
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        model_path = self.models_dir / f"{self.VOICE_MODEL}.onnx"
-        config_path = self.models_dir / f"{self.VOICE_MODEL}.onnx.json"
-        
-        if not model_path.exists():
-            print(f"{CYAN}[TTS] Downloading voice model ({self.VOICE_MODEL})...{RESET}")
-            r = http_session.get(self.MODEL_URL, stream=True)
-            r.raise_for_status()
-            with open(model_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            r = http_session.get(self.CONFIG_URL)
-            r.raise_for_status()
-            with open(config_path, 'wb') as f:
-                f.write(r.content)
-            print(f"{GREEN}[TTS] ✓ Model downloaded!{RESET}")
-        
-        return str(model_path)
-    
+        self._playback_done = threading.Event()  # signaled when playback finishes
+        self._playback_done.set()  # initially "done" (nothing playing)
+        self.current_playback = False
+        self.available = True
+        self._initialized = False
+        self._provider = None
+
     def initialize(self):
-        """Set up Piper executable and voice model."""
+        """Initialize the TTS provider."""
         try:
-            print(f"{CYAN}[TTS] Initializing Piper TTS (executable mode)...{RESET}")
-            
-            # Download/find piper executable
-            self.piper_exe = self._download_piper_executable()
-            if not self.piper_exe:
-                print(f"{YELLOW}[TTS] Could not set up Piper executable{RESET}")
-                self.available = False
-                return False
-            
-            # Download/find voice model
-            self.model_path = self._download_model()
-            
-            # Test the executable
-            try:
-                result = subprocess.run(
-                    [self.piper_exe, "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                print(f"{CYAN}[TTS] Piper version: {result.stdout.strip()}{RESET}")
-            except Exception as e:
-                print(f"{YELLOW}[TTS] Warning: Could not get Piper version: {e}{RESET}")
-            
-            # Start the worker thread
+            provider_name = TTS_PROVIDER.lower()
+
+            if provider_name == "kokoro":
+                print(f"{CYAN}[TTS] Initializing Kokoro TTS (local, hexgrad/Kokoro-82M)...{RESET}")
+                self._provider = _KokoroProvider()
+                label = "Kokoro (local)"
+            elif provider_name == "edge":
+                print(f"{CYAN}[TTS] Initializing Edge TTS...{RESET}")
+                self._provider = _EdgeTTSProvider()
+                label = "Edge TTS"
+            else:
+                print(f"{YELLOW}[TTS] Unknown provider '{provider_name}', falling back to Kokoro{RESET}")
+                self._provider = _KokoroProvider()
+                label = "Kokoro (local)"
+
             self.running = True
             self.worker_thread = threading.Thread(target=self._speech_worker, daemon=True)
             self.worker_thread.start()
-            
-            print(f"{GREEN}[TTS] ✓ Piper TTS ready ({self.VOICE_MODEL}){RESET}")
+            self._initialized = True
+
+            print(f"{GREEN}[TTS] ✓ {label} ready (auto-detect: en / pt-BR){RESET}")
             return True
-            
+
         except Exception as e:
             print(f"{YELLOW}[TTS] Failed to initialize: {e}{RESET}")
-            import traceback
-            traceback.print_exc()
+            self.available = False
             return False
-    
+
+    # ------------------------------------------------------------------
+    # Worker: collect sentences → synthesize as one block → play
+    # ------------------------------------------------------------------
+
     def _speech_worker(self):
-        """Background thread that plays queued sentences."""
+        """Background thread that collects queued sentences, then synthesizes
+        and plays the collected text as a single continuous audio clip."""
         while self.running:
             try:
                 if self.interrupt_event.is_set():
                     self.interrupt_event.clear()
-                
-                text = self.speech_queue.get(timeout=0.5)
-                if text is None:
+
+                # Block until the first sentence arrives
+                first = self.speech_queue.get(timeout=0.5)
+                if first is None:
                     break
-                
                 if self.interrupt_event.is_set():
                     self.speech_queue.task_done()
                     continue
 
-                self._speak_text(text)
+                # Collect more sentences that arrive within the timeout window
+                collected = [first]
                 self.speech_queue.task_done()
+
+                while True:
+                    try:
+                        more = self.speech_queue.get(timeout=_COLLECT_TIMEOUT)
+                        if more is None:
+                            # Poison pill — synthesize what we have, then exit
+                            collected_text = " ".join(collected)
+                            if collected_text.strip():
+                                self._playback_done.clear()
+                                try:
+                                    self._speak_text(collected_text)
+                                finally:
+                                    self._playback_done.set()
+                            return
+                        if more == _FLUSH_SENTINEL:
+                            # Explicit flush — speak everything collected now
+                            self.speech_queue.task_done()
+                            break
+                        if self.interrupt_event.is_set():
+                            self.speech_queue.task_done()
+                            break
+                        collected.append(more)
+                        self.speech_queue.task_done()
+                    except queue.Empty:
+                        # No more sentences within timeout — batch is complete
+                        break
+
+                if self.interrupt_event.is_set():
+                    continue
+
+                # Synthesize the full collected text as one clip
+                full_text = " ".join(collected)
+                if full_text.strip():
+                    print(f"{CYAN}[TTS] Speaking {len(collected)} sentence(s): '{full_text[:80]}...'{RESET}" if len(full_text) > 80 else f"{CYAN}[TTS] Speaking {len(collected)} sentence(s): '{full_text}'{RESET}")
+                    self._playback_done.clear()
+                    try:
+                        self._speak_text(full_text)
+                    finally:
+                        self._playback_done.set()
+
             except queue.Empty:
                 continue
-    
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """Remove emojis, special characters, and markdown that shouldn't be spoken."""
+        import emoji
+        text = emoji.replace_emoji(text, replace='')
+        # Remove markdown links [text](url) → text
+        text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+        # Remove code blocks
+        text = re.sub(r'```[\s\S]*?```', '', text)
+        text = re.sub(r'`[^`]+`', '', text)
+        # Remove markdown formatting (* _ ~ # >)
+        text = re.sub(r'[*_~`#>]', '', text)
+        # Remove bullet points and numbered lists markers
+        text = re.sub(r'^\s*[-•]\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*\d+[.)]\s+', '', text, flags=re.MULTILINE)
+        # Remove URLs
+        text = re.sub(r'https?://\S+', '', text)
+        # Remove parenthetical asides like (e.g., ...) that sound bad in TTS
+        text = re.sub(r'\([^)]{0,50}\)', '', text)
+        # Replace newlines with spaces
+        text = re.sub(r'\n+', ' ', text)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
     def _speak_text(self, text):
-        """Synthesize and play text using Piper executable."""
-        if not self.piper_exe or not self.model_path or not text.strip():
+        """Synthesize and play text as one continuous audio clip."""
+        text = self._clean_text(text)
+        if not text or len(text) < 2 or not self._provider:
             return
-        
+
         try:
-            # Run piper and capture raw audio output
-            cmd = [
-                self.piper_exe,
-                "--model", self.model_path,
-                "--output-raw"
-            ]
-            
-            self.current_process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            
-            # Send text to piper
-            stdout, stderr = self.current_process.communicate(
-                input=text.encode('utf-8'),
-                timeout=30
-            )
-            
-            if self.interrupt_event.is_set():
-                self.current_process = None
+            result = self._provider.synthesize(text, self.interrupt_event)
+            if result is None or self.interrupt_event.is_set():
                 return
-            
-            if self.current_process.returncode != 0:
-                print(f"{YELLOW}[TTS] Piper error: {stderr.decode('utf-8', errors='ignore')}{RESET}")
-                self.current_process = None
-                return
-            
-            self.current_process = None
-            
-            # Play the audio (Piper outputs 16-bit PCM at 22050 Hz)
-            if stdout and not self.interrupt_event.is_set():
-                audio_data = np.frombuffer(stdout, dtype=np.int16)
-                sd.play(audio_data, samplerate=22050, blocking=True)
-                
-        except subprocess.TimeoutExpired:
-            print(f"{YELLOW}[TTS] Synthesis timeout{RESET}")
-            if self.current_process:
-                self.current_process.kill()
-                self.current_process = None
+
+            audio_data, samplerate = result
+            self.current_playback = True
+            sd.play(audio_data, samplerate=samplerate, blocking=True)
+            self.current_playback = False
+
         except Exception as e:
             print(f"{YELLOW}[TTS Error]: {e}{RESET}")
-            import traceback
-            traceback.print_exc()
-    
+            self.current_playback = False
+
     def queue_sentence(self, sentence):
-        """Add a sentence to the speech queue."""
-        if self.enabled and self.piper_exe and sentence.strip():
+        if self.enabled and self._initialized and sentence.strip():
+            self._playback_done.clear()  # mark that there's pending work
             self.speech_queue.put(sentence)
-    
+
+    def flush_and_speak(self):
+        """Signal the worker to speak everything collected so far.
+        Call this after the LLM finishes streaming to avoid timeout delays."""
+        if self.enabled and self._initialized:
+            self.speech_queue.put(_FLUSH_SENTINEL)
+
     def stop(self):
-        """Interrupt current speech and clear queue."""
         self.interrupt_event.set()
         with self.speech_queue.mutex:
             self.speech_queue.queue.clear()
-        
-        # Stop current playback
         try:
             sd.stop()
         except:
             pass
-        
-        # Kill current piper process if running
-        if self.current_process:
-            try:
-                self.current_process.kill()
-            except:
-                pass
-            
+        self.current_playback = False
+
     def wait_for_completion(self):
-        """Wait for all queued speech to finish."""
+        """Wait until all queued text has been spoken."""
         if self.enabled:
             self.speech_queue.join()
-    
+            # Also wait for the actual audio playback to finish
+            self._playback_done.wait()
+
     def toggle(self, enable):
-        """Enable/disable TTS."""
-        if enable and not self.piper_exe:
+        if enable and not self._initialized:
             if self.initialize():
                 self.enabled = True
                 return True
             return False
         self.enabled = enable
         return True
-    
+
     def shutdown(self):
-        """Clean up resources."""
         self.running = False
         self.stop()
         self.speech_queue.put(None)
 
 
+# Backward-compatible alias
+PiperTTS = SmartTTS
+
 # Global TTS instance
-tts = PiperTTS()
+tts = SmartTTS()

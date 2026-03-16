@@ -108,24 +108,27 @@ def preload_models():
         except Exception as e:
             print(f"{GRAY}[Router] Failed to load local model: {e}{RESET}")
 
-    def load_responder():
-        try:
-            # Send a minimal prompt to force the model to fully load into VRAM
-            # The keep_alive ensures it stays loaded for 30 minutes
-            print(f"{GRAY}[System] Loading responder model ({RESPONDER_MODEL})...{RESET}")
-            response = http_session.post(f"{OLLAMA_URL}/generate", json={
-                "model": RESPONDER_MODEL, 
-                "prompt": "hi",
-                "stream": False,
-                "keep_alive": "30m",
-                "options": {"num_predict": 1}  # Generate just 1 token to minimize wait
-            }, timeout=120)  # 2 minute timeout for initial model load
-            if response.status_code == 200:
-                print(f"{GRAY}[System] Responder model loaded successfully.{RESET}")
-            else:
-                print(f"{GRAY}[System] Responder model load returned status {response.status_code}{RESET}")
-        except Exception as e:
-            print(f"{GRAY}[System] Failed to preload responder: {e}{RESET}")
+    def load_responders():
+        """Preload all LLM models used by smart routing."""
+        from config import MODEL_ROUTING
+        # Get unique models from routing config
+        models = list({cfg[0] for cfg in MODEL_ROUTING.values()})
+        for model_name in models:
+            try:
+                print(f"{GRAY}[System] Loading {model_name}...{RESET}")
+                response = http_session.post(f"{OLLAMA_URL}/generate", json={
+                    "model": model_name,
+                    "prompt": "hi",
+                    "stream": False,
+                    "keep_alive": "30m",
+                    "options": {"num_predict": 1}
+                }, timeout=120)
+                if response.status_code == 200:
+                    print(f"{GRAY}[System] {model_name} loaded.{RESET}")
+                else:
+                    print(f"{GRAY}[System] {model_name} load returned {response.status_code}{RESET}")
+            except Exception as e:
+                print(f"{GRAY}[System] Failed to preload {model_name}: {e}{RESET}")
 
     def load_voice():
         print(f"{GRAY}[System] Loading voice model...{RESET}")
@@ -133,7 +136,7 @@ def preload_models():
 
     # Create threads
     threads.append(threading.Thread(target=load_router))
-    threads.append(threading.Thread(target=load_responder))
+    threads.append(threading.Thread(target=load_responders))
     threads.append(threading.Thread(target=load_voice))
 
     # Start all

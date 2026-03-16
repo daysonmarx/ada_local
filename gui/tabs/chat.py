@@ -94,6 +94,7 @@ class ChatTab(QWidget):
         self.tts_toggle = SwitchButton()
         self.tts_toggle.setOnText("Voice On")
         self.tts_toggle.setOffText("Voice Off")
+        self.tts_toggle.setChecked(True)
         header_layout.addWidget(self.tts_toggle)
 
         chat_layout.addWidget(header)

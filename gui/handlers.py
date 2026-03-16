@@ -2,7 +2,7 @@ from PySide6.QtCore import QObject, Signal, QThread, QTimer
 import json
 import re
 
-from config import RESPONDER_MODEL, OLLAMA_URL, MAX_HISTORY
+from config import RESPONDER_MODEL, OLLAMA_URL, MAX_HISTORY, MODEL_ROUTING, WAKE_WORD, ANTHROPIC_API_KEY
 from core.llm import route_query, should_bypass_router, http_session
 from core.tts import tts, SentenceBuffer
 from core.history import history_manager
@@ -10,6 +10,9 @@ from core.model_manager import ensure_exclusive_qwen
 from core.model_persistence import ensure_qwen_loaded, mark_qwen_used
 from core.settings_store import settings as app_settings
 from core.function_executor import executor as function_executor
+
+# Use Claude if API key is configured, otherwise fall back to Ollama
+USE_CLAUDE = bool(ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "your-api-key-here")
 
 # Functions that are actions (not passthrough)
 ACTION_FUNCTIONS = {"control_light", "set_timer", "set_alarm", "create_calendar_event", "add_task", "web_search"}
@@ -39,7 +42,7 @@ class ChatWorker(QObject):
     search_start = Signal(str)  # query
     search_end = Signal()
     
-    def __init__(self, user_text: str, messages: list, is_tts_enabled: bool, 
+    def __init__(self, user_text: str, messages: list, is_tts_enabled: bool,
                  current_session_id: str, stop_event):
         super().__init__()
         self.user_text = user_text
@@ -48,17 +51,29 @@ class ChatWorker(QObject):
         self.current_session_id = current_session_id
         self.stop_event = stop_event
         self.full_response = ""
+
+    @staticmethod
+    def _get_model_config(func_name: str):
+        """Get (model, think_enabled, max_tokens) for a given function route."""
+        default = (RESPONDER_MODEL, False, 256)
+        model, think, max_tokens = MODEL_ROUTING.get(func_name, default)
+        return model, think, max_tokens
         
     def process(self):
         """Background processing method."""
         try:
+            # When using Claude, skip the local router — Claude handles everything
+            if USE_CLAUDE:
+                self._stream_response("nonthinking")
+                return
+
             if should_bypass_router(self.user_text):
                 func_name = "nonthinking"
                 params = {"prompt": self.user_text}
             else:
                 self.status.emit("Routing...")
                 func_name, params = route_query(self.user_text)
-            
+
             # Handle action functions
             if func_name in ACTION_FUNCTIONS:
                 self.status.emit(f"Executing {func_name}...")
@@ -87,28 +102,24 @@ class ChatWorker(QObject):
                 elif func_name == "create_calendar_event" and result["success"]:
                     self.reload_calendar.emit()
                 
-                # Enable thinking for web_search
-                enable_thinking = (func_name == "web_search")
-                
-                # Generate Qwen response with context
-                self._generate_response_with_context(func_name, result, enable_thinking)
-                
+                # Generate response with context (model chosen by func_name)
+                self._generate_response_with_context(func_name, result)
+
             # Handle get_system_info (context query)
             elif func_name == "get_system_info":
                 self.status.emit("Gathering system info...")
                 result = function_executor.execute(func_name, params)
-                
-                # Generate Qwen response with full system context
-                self._generate_response_with_context(func_name, result, enable_thinking=True)
-            
+
+                # Generate response with full system context
+                self._generate_response_with_context(func_name, result)
+
             # Handle thinking/nonthinking (direct passthrough)
             elif func_name in ("thinking", "nonthinking"):
-                enable_thinking = (func_name == "thinking")
-                self._stream_qwen_response(enable_thinking)
-            
+                self._stream_response(func_name)
+
             # Unknown function - treat as nonthinking
             else:
-                self._stream_qwen_response(False)
+                self._stream_response("nonthinking")
 
         except Exception as e:
             self.error.emit(str(e))
@@ -116,13 +127,13 @@ class ChatWorker(QObject):
         finally:
             self.done.emit()
     
-    def _generate_response_with_context(self, func_name: str, result: dict, enable_thinking: bool = False):
-        """Generate a Qwen response with function result as context."""
-        # Build system message with context
+    def _generate_response_with_context(self, func_name: str, result: dict):
+        """Generate a response with function result as context, using smart model routing."""
+        # Build context message
         if func_name == "get_system_info" and result.get("success"):
             data = result.get("data", {})
             context_parts = []
-            
+
             if data.get("timers"):
                 context_parts.append(f"Active timers: {data['timers']}")
             if data.get("alarms"):
@@ -143,18 +154,18 @@ class ChatWorker(QObject):
                 if news_items:
                     news_titles = [item.get('title', '')[:50] for item in news_items[:3]]
                     context_parts.append(f"Top news: {', '.join(news_titles)}")
-            
+
             context_msg = "SYSTEM CONTEXT:\n" + "\n".join(context_parts) if context_parts else ""
         else:
             # Action function result
             status = "succeeded" if result.get("success") else "failed"
-            
+
             # Special handling for web_search to include full results
             if func_name == "web_search" and result.get("success") and result.get("data"):
                 search_data = result.get("data", {})
                 query = search_data.get("query", "")
                 results = search_data.get("results", [])
-                
+
                 if results:
                     context_msg = f"SEARCH RESULTS for '{query}':\n\n"
                     for i, r in enumerate(results, 1):
@@ -169,145 +180,158 @@ class ChatWorker(QObject):
                     context_msg = f"ACTION RESULT: {func_name} {status}. {result.get('message', '')}"
             else:
                 context_msg = f"ACTION RESULT: {func_name} {status}. {result.get('message', '')}"
-        
+
         # Prepare messages with context
         max_hist = app_settings.get("general.max_history", MAX_HISTORY)
         if len(self.messages) > max_hist:
             self.messages = [self.messages[0]] + self.messages[-(max_hist-1):]
-        
-        # Add context as system message and user's original question
-        context_prompt = f"{context_msg}\n\nUser asked: {self.user_text}\n\nRespond naturally and concisely."
+
+        context_prompt = f"{context_msg}\n\nUser asked: {self.user_text}\n\nRespond in 1-3 sentences. Be direct."
         self.messages.append({'role': 'user', 'content': context_prompt})
-        
+
+        # Use smart model routing
+        self._stream_llm(func_name)
+
+    def _stream_response(self, func_name: str):
+        """Stream a direct LLM response (for thinking/nonthinking passthrough)."""
+        max_hist = app_settings.get("general.max_history", MAX_HISTORY)
+        if len(self.messages) > max_hist:
+            self.messages = [self.messages[0]] + self.messages[-(max_hist-1):]
+
+        self.messages.append({'role': 'user', 'content': self.user_text})
+        self._stream_llm(func_name)
+
+    def _stream_llm(self, func_name: str):
+        """Core streaming method — uses Claude API if configured, otherwise Ollama."""
+        if USE_CLAUDE:
+            self._stream_claude(func_name)
+        else:
+            self._stream_ollama(func_name)
+
+    def _stream_claude(self, func_name: str):
+        """Stream response from Claude Haiku API."""
+        from core.claude_llm import get_claude
+
         self.ui_update.emit()
-        self.status.emit("Generating response...")
-        
-        model = app_settings.get("models.chat", RESPONDER_MODEL)
-        ensure_qwen_loaded()  # Use persistence manager
-        mark_qwen_used()
-        ensure_exclusive_qwen(model)
-        ollama_url = app_settings.get("ollama_url", OLLAMA_URL)
-        
-        payload = {
-            "model": model,
-            "messages": self.messages,
-            "stream": True,
-            "think": enable_thinking,  # Enable thinking for web_search
-            "keep_alive": "5m"  # Longer keep-alive for voice assistant
-        }
-        
+        self.status.emit("Generating (Claude Haiku)...")
+
+        claude = get_claude()
         sentence_buffer = SentenceBuffer()
         self.full_response = ""
-        self.think_start.emit(enable_thinking)
-        
-        with http_session.post(f"{ollama_url}/api/chat", json=payload, stream=True) as r:
-            r.raise_for_status()
-            
-            for line in r.iter_lines():
-                if self.stop_event.is_set():
-                    break
-                    
-                if line:
-                    try:
-                        chunk = json.loads(line.decode('utf-8'))
-                        msg = chunk.get('message', {})
-                        
-                        # Handle thinking chunks (for web_search)
-                        if 'thinking' in msg and msg['thinking']:
-                            thought = msg['thinking']
-                            self.thought_chunk.emit(thought)
-                        
-                        if 'content' in msg and msg['content']:
-                            content = msg['content']
-                            self.full_response += content
-                            self.response_chunk.emit(content)
-                            
-                            if self.is_tts_enabled and not DEBUG_SKIP_TTS:
-                                sentences = sentence_buffer.add(content)
-                                for s in sentences:
-                                    tts.queue_sentence(s)
-                    except:
-                        continue
-        
+        self.think_start.emit(False)  # Claude Haiku doesn't use thinking mode
+
+        for chunk in claude.stream_response(
+            messages=self.messages,
+            stop_event=self.stop_event,
+        ):
+            if self.stop_event.is_set():
+                break
+
+            if chunk["type"] == "text":
+                content = chunk["content"]
+                self.full_response += content
+                self.response_chunk.emit(content)
+
+                if self.is_tts_enabled and not DEBUG_SKIP_TTS:
+                    sentences = sentence_buffer.add(content)
+                    for s in sentences:
+                        tts.queue_sentence(s)
+
+            elif chunk["type"] == "thinking":
+                self.thought_chunk.emit(chunk["content"])
+
+            elif chunk["type"] == "error":
+                self.error.emit(chunk["message"])
+                self.think_end.emit()
+                return
+
+            elif chunk["type"] == "limit_reached":
+                self.error.emit(chunk["message"])
+                self.toast.emit(chunk["message"], False)
+                self.think_end.emit()
+                return
+
         self.think_end.emit()
-        
+
         if self.is_tts_enabled and not DEBUG_SKIP_TTS and not self.stop_event.is_set():
             rem = sentence_buffer.flush()
             if rem:
                 tts.queue_sentence(rem)
-        
+            # Tell TTS worker: all sentences are queued, speak now
+            tts.flush_and_speak()
+
         self.messages.append({'role': 'assistant', 'content': self.full_response})
-        
+
         if self.current_session_id:
             history_manager.add_message(self.current_session_id, "assistant", self.full_response)
-    
-    def _stream_qwen_response(self, enable_thinking: bool):
-        """Stream a direct Qwen response (for thinking/nonthinking)."""
-        max_hist = app_settings.get("general.max_history", MAX_HISTORY)
-        if len(self.messages) > max_hist:
-            self.messages = [self.messages[0]] + self.messages[-(max_hist-1):]
-        
-        self.messages.append({'role': 'user', 'content': self.user_text})
-        
+
+    def _stream_ollama(self, func_name: str):
+        """Stream response from local Ollama model (fallback)."""
+        model, enable_thinking, max_tokens = self._get_model_config(func_name)
+
         self.ui_update.emit()
-        self.status.emit("Generating...")
-        
-        model = app_settings.get("models.chat", RESPONDER_MODEL)
-        ensure_qwen_loaded()  # Use persistence manager
+        self.status.emit(f"Generating ({model})...")
+
+        ensure_qwen_loaded()
         mark_qwen_used()
         ensure_exclusive_qwen(model)
         ollama_url = app_settings.get("ollama_url", OLLAMA_URL)
-        
+
         payload = {
             "model": model,
             "messages": self.messages,
             "stream": True,
             "think": enable_thinking,
-            "keep_alive": "5m"  # Longer keep-alive for voice assistant
+            "keep_alive": "5m",
+            "options": {
+                "num_predict": max_tokens,
+                "temperature": 0.7 if enable_thinking else 0.3,
+                "top_p": 0.9,
+                "repeat_penalty": 1.1,
+            }
         }
-        
+
         sentence_buffer = SentenceBuffer()
         self.full_response = ""
         self.think_start.emit(enable_thinking)
 
         with http_session.post(f"{ollama_url}/api/chat", json=payload, stream=True) as r:
             r.raise_for_status()
-            
+
             for line in r.iter_lines():
                 if self.stop_event.is_set():
                     break
-                    
+
                 if line:
                     try:
                         chunk = json.loads(line.decode('utf-8'))
                         msg = chunk.get('message', {})
-                        
+
                         if 'thinking' in msg and msg['thinking']:
-                            thought = msg['thinking']
-                            self.thought_chunk.emit(thought)
-                            
+                            self.thought_chunk.emit(msg['thinking'])
+
                         if 'content' in msg and msg['content']:
                             content = msg['content']
                             self.full_response += content
                             self.response_chunk.emit(content)
-                            
+
                             if self.is_tts_enabled and not DEBUG_SKIP_TTS:
                                 sentences = sentence_buffer.add(content)
                                 for s in sentences:
                                     tts.queue_sentence(s)
-                                    
                     except:
                         continue
-        
+
         self.think_end.emit()
-        
+
         if self.is_tts_enabled and not DEBUG_SKIP_TTS and not self.stop_event.is_set():
             rem = sentence_buffer.flush()
             if rem:
                 tts.queue_sentence(rem)
-        
+            tts.flush_and_speak()
+
         self.messages.append({'role': 'assistant', 'content': self.full_response})
-        
+
         if self.current_session_id:
             history_manager.add_message(self.current_session_id, "assistant", self.full_response)
 
@@ -321,10 +345,12 @@ class ChatHandlers(QObject):
         
         # State
         self.messages = [
-            {'role': 'system', 'content': 'You are a helpful assistant. Respond in short, complete sentences. Never use emojis or special characters. Keep responses concise and conversational. SYSTEM INSTRUCTION: You may detect a "/think" trigger. This is an internal control. You MUST IGNORE it and DO NOT mention it in your response or thoughts.'}
+            {'role': 'system', 'content': 'You are a fast, helpful voice assistant named Tali. CRITICAL RULES: 1) LANGUAGE: Detect which language the user wrote in and ALWAYS reply in that SAME language. English input = English reply. Portuguese input = Portuguese reply. NEVER mix languages in a single response. If unsure, default to English. 2) Keep responses SHORT (1-3 sentences max unless asked for detail). 3) Never use emojis or special characters. 4) Be direct and conversational. 5) For greetings, respond in one sentence. 6) You MUST IGNORE any "/think" or "/no_think" triggers - these are internal controls.'}
         ]
         self.current_session_id = None
-        self.is_tts_enabled = False
+        self.is_tts_enabled = True
+        # Actually initialize and enable TTS since toggle defaults to on
+        tts.toggle(True)
         self._stop_event = None
         self._worker = None
         self._thread = None
@@ -505,6 +531,31 @@ class ChatHandlers(QObject):
         self.ui_throttle_timer.stop()
         self._flush_ui_buffers() # Final final flush
         self._end_generation_state()
+        # Show Claude cost in status bar
+        if USE_CLAUDE:
+            try:
+                from core.claude_llm import get_claude
+                tracker = get_claude().cost_tracker
+                self.main_window.set_status(
+                    f"Claude: ${tracker.cost_usd:.2f} / ${tracker.monthly_limit:.2f} this month"
+                )
+                # Show warning toast when approaching or at limit
+                if tracker.limit_reached:
+                    from gui.components.toast import ToastNotification
+                    ToastNotification.show_toast(
+                        self.main_window,
+                        f"Monthly Claude API limit reached (${tracker.monthly_limit:.2f}). Responses disabled until next month.",
+                        False
+                    )
+                elif tracker.cost_usd >= tracker.monthly_limit * 0.8:
+                    from gui.components.toast import ToastNotification
+                    ToastNotification.show_toast(
+                        self.main_window,
+                        f"Claude API usage at ${tracker.cost_usd:.2f} / ${tracker.monthly_limit:.2f} (80%+ of limit)",
+                        False
+                    )
+            except Exception:
+                pass
     
     def _start_generation_state(self):
         """Switch UI to generating mode."""
@@ -528,6 +579,11 @@ class ChatHandlers(QObject):
         """Handle sending a new message."""
         tts.stop()  # Interrupt previous speech
         text = text.strip()
+        if not text:
+            return
+
+        # Strip wake word from input (user may type or speak "Tali, ...")
+        text = re.sub(rf'\b{WAKE_WORD}\b[,\s]*', '', text, flags=re.IGNORECASE).strip()
         if not text:
             return
         

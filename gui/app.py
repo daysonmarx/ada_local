@@ -17,7 +17,7 @@ from gui.handlers import ChatHandlers
 from core.model_manager import unload_all_models
 from core.voice_assistant import voice_assistant
 from core.tts import tts
-from config import VOICE_ASSISTANT_ENABLED, GREEN, RESET
+from config import VOICE_ASSISTANT_ENABLED, CYAN, GRAY, GREEN, RESET
 
 from gui.styles import AURA_STYLESHEET 
 
@@ -103,28 +103,27 @@ class MainWindow(FluentWindow):
             print(f"[App] Connecting voice assistant signals...")
             voice_assistant.wake_word_detected.connect(self._on_wake_word_detected)
             voice_assistant.speech_recognized.connect(self._on_speech_recognized)
-            voice_assistant.processing_finished.connect(self._on_processing_finished)
-            # Connect GUI update signals
-            voice_assistant.timer_set.connect(self._on_voice_timer_set)
-            voice_assistant.alarm_added.connect(self._on_voice_alarm_added)
-            voice_assistant.calendar_updated.connect(self._on_voice_calendar_updated)
-            voice_assistant.task_added.connect(self._on_voice_task_added)
             print(f"[App] ✓ Signals connected")
             
             # Initialize in background thread to avoid blocking UI
             def init_va():
-                print(f"[App] Background thread: Initializing voice assistant...")
-                if voice_assistant.initialize():
-                    print(f"[App] Background thread: ✓ Voice assistant initialized")
-                    # Enable TTS for voice assistant
-                    tts.toggle(True)
-                    print(f"[App] Background thread: TTS enabled")
-                    # Start listening
-                    print(f"[App] Background thread: Starting voice assistant...")
-                    voice_assistant.start()
-                    print(f"[App] Background thread: ✓ Voice assistant started")
-                else:
-                    print(f"[App] Background thread: ✗ Failed to initialize voice assistant")
+                try:
+                    print(f"[App] Background thread: Initializing voice assistant...")
+                    if voice_assistant.initialize():
+                        print(f"[App] Background thread: ✓ Voice assistant initialized")
+                        # Enable TTS for voice assistant
+                        tts.toggle(True)
+                        print(f"[App] Background thread: TTS enabled")
+                        # Start listening
+                        print(f"[App] Background thread: Starting voice assistant...")
+                        voice_assistant.start()
+                        print(f"[App] Background thread: ✓ Voice assistant started")
+                    else:
+                        print(f"[App] Background thread: ✗ Failed to initialize voice assistant")
+                except Exception as e:
+                    print(f"[App] Background thread: ✗ Voice assistant error: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             threading.Thread(target=init_va, daemon=True).start()
         else:
@@ -142,9 +141,10 @@ class MainWindow(FluentWindow):
             print(f"{GRAY}[App] Voice assistant disabled in config{RESET}")
     
     def _on_speech_recognized(self, text: str):
-        """Handle speech recognition - update indicator text if needed."""
-        # Keep showing indicator while processing
-        pass
+        """Handle speech recognition - route through chat handlers so it shows in the GUI."""
+        print(f"{CYAN}[App] Voice speech recognized: '{text}' — routing to chat{RESET}")
+        if text.strip():
+            self.handlers.send_message(text)
     
     def _on_processing_finished(self):
         """Handle processing finished - hide listening indicator."""
